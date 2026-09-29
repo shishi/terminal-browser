@@ -39,6 +39,9 @@ Update an installed profile with `nix profile upgrade terminal-browser`. When us
 this flake as an input, update it with `nix flake update` and rebuild your configuration.
 `terminal-browser upgrade` displays Nix update instructions instead of running the installer.
 
+### Claude code plugin
+[Install instructions here](/claude-code-plugin/README.md)
+
 ### Usage
 ```
 terminal-browser # launches the browser
@@ -47,6 +50,8 @@ terminal-browser --split right # opens the browser in a split pane to the right
 terminal-browser open --ssh <user@host> <url> # performs all network requests through a remote server
 terminal-browser ls # lists open browsers
 terminal-browser action # an agent-browser compatible cli for interacting with open terminal-browsers
+terminal-browser upgrade # upgrade to the latest version
+
 ```
 
 
@@ -90,6 +95,8 @@ After the browser engine starts and is displaying pixels in the terminal, it nee
 
 The outer UI of the browser is implemented using a graphics engine built on top of rust. The actual UI is defined inside react with a custom react renderer, which allows us to build the UI for the browser using typescript. The UI of the outer browser and the browser content itself is all drawn to the same shared canvas inside the rust engine, which allows us to layer UI on top of the browser.
 
+The underlying logic described here has been abstracted into a javascript library that you can use to build your own graphical applications in the terminal - https://github.com/zenbu-labs/pixel
+
 ### SSH
 The recommended way to use terminal-browser over ssh is running `terminal-browser --ssh <ssh arguments>`.
 
@@ -102,42 +109,9 @@ The alternative is running terminal-browser directly on the machine you are shh'
 
 
 
-### App Mode
-terminal-browser can be used to build apps in the terminal using browser technology. You can reference `terminal-code` as a production usage example - https://github.com/zenbu-labs/terminal-code
-
-This is accessible by using the `--app-mode` option when spawning terminal-browser, and optionally using the `preload` and `main-script` options that use electron's [preload scripts](https://www.electronjs.org/docs/latest/tutorial/tutorial-preload) and main script under the hood. 
-
-The following options are the full set of app related options available for `terminal-browser open`
-```
-  --preload=<path>      Run a script inside the context of a web page before it loads (uses electron's preload feature under the hood, runs in an isolated world).
-                        terminal-browser specific api's are exposed on globalThis.terminalBrowser
-                        {
-                          theme: () => { background: [r,g,b], foreground: [r,g,b], ansi: ([r,g,b] | null)[] } | null, // null until the terminal reports its colors
-                          onTheme: (cb: (theme: Theme) => void) => () => void, // returns unsubscribe
-                          quit: () => void // closes this browser window
-                        }
-                        --terminal-browser-session=<key> is passed as extra arguments to the renderer process, available via process.argv
-  --main-script=<path>  Run a node.js script in the same process as the browser (this is an electron main process)
-  --open-tabs-in-popup-stack Links that would open a new tab open a popup over the
-                        page instead.
-  --allow-clipboard-read
-                        Lets websites read from clipboard.
-  --no-toolbar          No toolbar or tab strip
-  --no-shortcuts        No browser shortcuts, keys go to the page
-  --no-context-menu     No right-click menu
-  --no-overlays         No toasts or HUDs drawn over the page
-  --no-frame            No border or padding, the page fills the pane
-  --app-mode            Shorthand for --no-toolbar --no-shortcuts
-                        --no-context-menu --no-overlays --no-frame
-                        --allow-clipboard-read --open-tabs-in-popup-stack
-  --ssh-bundle <dir>    Install and execute a bundle on a remote server. This is useful when paired with
-                        --app-mode and --ssh, allowing you to run an application server on a
-                        remote machine, then view the output over ssh
-  --ssh-bundle-dir <dir>
-                        The path --ssh-bundle should be installed to through the ssh server. Defaults to
-                        ${XDG_DATA_HOME:-~/.local/share}/terminal-browser/bundles
-
-```
+### Embedded mode
+terminal-browser supports embedding inside of existing TUIs. See
+[examples/embedded](examples/embedded/) for a reference implementation
 
 ### Roadmap
 - linux support ✅

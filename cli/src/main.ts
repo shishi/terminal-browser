@@ -7,14 +7,15 @@ import path from "node:path";
 import {
   DAEMON_SOCKET,
   LOGS_DIR,
+  TERMINAL_SOCKET_ENV,
   appId,
   ensureDataDir,
   instanceKey,
   listApps,
   registerApp,
+  socketTerminal,
   unregisterApp,
 } from "pixel-store";
-import type { OpenSpec } from "pixel-store";
 import {
   callerTty,
   canSplit,
@@ -22,8 +23,9 @@ import {
   checkTerminal,
   detect,
   unsupportedGraphicsMessage,
-} from "pixel-terminals";
-import type { Direction, Terminal, TerminalCheck } from "pixel-terminals";
+} from "@zenbu-labs/pixel/terminal";
+import { findOwner } from "@zenbu-labs/pixel/terminal";
+import type { Direction, Terminal, TerminalCheck } from "@zenbu-labs/pixel/terminal";
 import { actionCommand } from "./action";
 import { control } from "./control";
 import { setupCommand } from "./editors";
@@ -35,12 +37,13 @@ import { findHosts, openInHost } from "./interop";
 import { lsCommand } from "./ls";
 import { instances } from "./registry";
 import { apparmorSetup, deniedRefusal, linuxSandboxError, sandboxRefusal } from "./sandbox";
-import { openSshTunnel, startBundle, validateBundleDir, validateSshTarget } from "./ssh";
-import type { RemoteBundle } from "./ssh";
+import { connectSsh, validateSshTarget } from "@zenbu-labs/pixel/ssh";
 import type { InstanceRecord } from "./registry";
 import { installedVersion, upgradeCommand } from "./upgrade";
+import { claudeBridgeCommand } from "./claude-bridge";
 
 const DIST_ROOT = process.env.TERMINAL_BROWSER_DIST_ROOT ?? null;
+const CAPABILITIES = ["embedding"] as const;
 delete process.env.ELECTRON_RUN_AS_NODE;
 
 function fail(message: string): never {
@@ -73,20 +76,20 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const ELECTRON_DIST_BIN =
   process.platform === "darwin"
     ? ["terminal-browser.app", "Contents", "MacOS", "terminal-browser"]
-    : ["electron"];
+    : ["pixel"];
 const ELECTRON_DEV_BIN =
   process.platform === "darwin"
-    ? ["Electron.app", "Contents", "MacOS", "Electron"]
-    : ["electron"];
+    ? ["Electron.app", "Contents", "MacOS", "pixel"]
+    : ["pixel"];
 
 function browserDirectory(): string {
   return path.resolve(__dirname, "..", "..", "browser");
 }
 
 function electronBinary(): string {
-  return DIST_ROOT
-    ? path.join(DIST_ROOT, "electron", ...ELECTRON_DIST_BIN)
-    : path.join(browserDirectory(), "node_modules", "electron", "dist", ...ELECTRON_DEV_BIN);
+  if (DIST_ROOT) return path.join(DIST_ROOT, "electron", ...ELECTRON_DIST_BIN);
+  const library = require.resolve("@zenbu-labs/pixel/package.json", { paths: [browserDirectory()] });
+  return path.join(path.dirname(library), "electron", "dist", ...ELECTRON_DEV_BIN);
 }
 
 function browserLaunchCommand(argv: string[]): { command: string[]; cwd: string } {
@@ -164,7 +167,11 @@ function connectDaemon(): Promise<net.Socket> {
 
 function spawnDaemon() {
   const { command, cwd } = browserLaunchCommand(["--daemon"]);
-  const child = spawn(command[0], command.slice(1), { cwd, detached: true, stdio: "ignore" });
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !key.startsWith("PIXEL_")),
+  );
+  env.NODE_ENV ??= "production";
+  const child = spawn(command[0], command.slice(1), { cwd, detached: true, stdio: "ignore", env });
   child.unref();
 }
 
@@ -313,7 +320,7 @@ async function kill(pid: number, why: string): Promise<number> {
 }
 
 async function attachHere(argv: string[]): Promise<never> {
-  const tty = ownTtyPath();
+  const tty = process.env.PIXEL_TTY ?? ownTtyPath();
   if (!tty) throw new Error("not running on a tty");
   const { socket, reply } = await openSession(argv, tty);
   if (reply.ok === false || !reply.session) {
@@ -358,25 +365,11 @@ function flagEq(argv: string[], flag: string): string | undefined {
 async function sshSetup(argv: string[]): Promise<void> {
   const target = flagEq(argv, "--ssh");
   if (!target) return;
-  const status = (line: string) => process.stdout.write(`ssh: ${line}\n`);
   const interrupt = () => process.exit(130);
   const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
   for (const signal of signals) process.on(signal, interrupt);
-  let bundle: RemoteBundle | null = null;
-  const tunnel = await openSshTunnel(target, status);
-  process.on("exit", () => {
-    try {
-      bundle?.stop();
-    } catch {}
-    tunnel.stop();
-  });
-  argv.push(`--socks-port=${tunnel.socksPort}`);
-  const bundleDir = flagEq(argv, "--ssh-bundle");
-  if (bundleDir) {
-    const remoteBase = flagEq(argv, "--ssh-bundle-dir");
-    bundle = await startBundle(tunnel, bundleDir, status, remoteBase || undefined);
-    if (!argv.some((arg) => !arg.startsWith("-"))) argv.unshift(bundle.url);
-  }
+  const session = await connectSsh({ target, status: (line) => process.stdout.write(`ssh: ${line}\n`) });
+  argv.push(`--socks-port=${session.socksPort}`);
   for (const signal of signals) process.removeListener(signal, interrupt);
 }
 
@@ -423,7 +416,7 @@ async function launchInSplit(
     size: size ?? null,
     tty: ownTtyPath() ?? callerTty().path,
   });
-  // ssh auth prompts and bundle installs run inside the new pane first
+  // ssh auth prompts run inside the new pane first
   const patience = argv.some((arg) => arg.startsWith("--ssh=")) ? 600_000 : 20_000;
   const deadline = Date.now() + patience;
   while (Date.now() < deadline) {
@@ -431,7 +424,7 @@ async function launchInSplit(
     if (fresh) {
       return fresh;
     }
-    await sleep(250);
+    await sleep(50);
   }
   fail(`browser did not register within ${Math.round(patience / 1000)}s (is the split open?)`);
 }
@@ -439,7 +432,8 @@ async function launchInSplit(
 let asked: Promise<TerminalCheck> | null = null;
 
 function currentTerminal(): Promise<TerminalCheck> {
-  asked ??= checkTerminal(detect());
+  const socket = process.env[TERMINAL_SOCKET_ENV];
+  asked ??= checkTerminal(socket ? socketTerminal(socket) : detect());
   return asked;
 }
 
@@ -460,7 +454,7 @@ async function newTabCommand(url: string | undefined, key: string | undefined): 
     print(await control(target.socket, where));
     return 0;
   }
-  if (!key && !mergeDisabled() && (await tryAdopt(url ? [url] : []))) return 0;
+  if (!key && !mergeDisabled() && (await tryAdopt(url ? [url] : [], null))) return 0;
   await requireGraphics(check);
   const argv = url ? [url] : [];
   if (interactiveTty()) return openHere(argv);
@@ -480,59 +474,53 @@ async function requireGraphics(check: TerminalCheck) {
 }
 
 const BROWSER_FLAGS = [
+  "--allow-clipboard-read",
+  "--ssh=",
+  "--split-dir=",
+  "--parent-tty=",
+];
+
+const APP_MODE_FLAGS = [
   "--app-mode",
+  "--preload",
+  "--main-script",
+  "--app-name",
+  "--app-id",
+  "--open-tabs-in-popup-stack",
   "--no-toolbar",
   "--no-shortcuts",
   "--no-context-menu",
   "--no-overlays",
   "--no-frame",
-  "--open-tabs-in-popup-stack",
-  "--allow-clipboard-read",
-  "--partition=",
-  "--ssh=",
-  "--ssh-bundle=",
-  "--ssh-bundle-dir=",
-  "--preload=",
-  "--main-script=",
-  "--app-name=",
-  "--app-id=",
-  "--palette-key=",
-  "--find-key=",
-  "--devtools-key=",
-  "--console-key=",
-  "--split-dir=",
-  "--parent-tty=",
 ];
 
 function rejectUnknownFlags(args: string[]) {
   for (const arg of args) {
     if (!arg.startsWith("-")) continue;
+    const name = arg.split("=")[0];
+    if (APP_MODE_FLAGS.includes(name)) {
+      fail(
+        `${name} is deprecated: app mode was removed from terminal-browser. If you are building an app, you should migrate to https://github.com/zenbu-labs/pixel`,
+      );
+    }
     const known = BROWSER_FLAGS.some((flag) =>
       flag.endsWith("=") ? arg.startsWith(flag) : arg === flag,
     );
-    if (!known) fail(`unknown option ${arg.split("=")[0]} (terminal-browser open --help)`);
+    if (!known) fail(`unknown option ${name} (terminal-browser open --help)`);
   }
 }
 
 function takeSshFlags(args: string[]): void {
+  if (args.some((arg) => /^--ssh-bundle(-dir)?(=|$)/.test(arg))) {
+    fail(
+      "--ssh-bundle and --ssh-bundle-dir are no longer part of terminal-browser. If you are building an app, you should migrate to https://github.com/zenbu-labs/pixel",
+    );
+  }
   const ssh = takeFlag(args, "--ssh");
   if (ssh !== undefined) args.push(`--ssh=${ssh}`);
-  const bundle = takeFlag(args, "--ssh-bundle");
-  if (bundle !== undefined) args.push(`--ssh-bundle=${bundle}`);
-  const bundleDir = takeFlag(args, "--ssh-bundle-dir");
-  if (bundleDir !== undefined) args.push(`--ssh-bundle-dir=${bundleDir}`);
-  const at = args.findIndex((arg) => arg.startsWith("--ssh-bundle="));
-  if (at >= 0) {
-    args[at] = `--ssh-bundle=${path.resolve(args[at].slice("--ssh-bundle=".length))}`;
-  }
   const target = args.find((arg) => arg.startsWith("--ssh="))?.slice("--ssh=".length);
-  if (at >= 0 && !target) fail("--ssh-bundle needs --ssh");
-  if (args.some((arg) => arg.startsWith("--ssh-bundle-dir=")) && at < 0) {
-    fail("--ssh-bundle-dir needs --ssh-bundle");
-  }
   try {
     if (target) validateSshTarget(target);
-    if (at >= 0) validateBundleDir(args[at].slice("--ssh-bundle=".length));
   } catch (error) {
     fail(error instanceof Error ? error.message : String(error));
   }
@@ -547,37 +535,24 @@ function mergeDisabled(): boolean {
   return process.env.TERMINAL_BROWSER_NO_MERGE === "1";
 }
 
-async function tryAdopt(args: string[]): Promise<boolean> {
+async function tryAdopt(args: string[], direction: Direction | null): Promise<boolean> {
   const terminal = (await currentTerminal()).terminal;
-  const hosts = await findHosts(terminal).catch(() => []);
+  let hosts = await findHosts(terminal).catch(() => []);
   if (hosts.length === 0) return false;
+  if (direction) {
+    if (!terminal?.neighbor || !terminal.getCurrentPane) return false;
+    const current = await terminal.getCurrentPane({ tty: callerTty().path, cwd: process.cwd() }).catch(() => null);
+    if (!current) return false;
+    const beside = await terminal.neighbor(current, direction).catch(() => null);
+    if (!beside) return false;
+    hosts = hosts.filter((host) => host.pane === beside.id);
+    if (hosts.length === 0) return false;
+  }
   const url = args.find((arg) => !arg.startsWith("-"));
   const resolved = url && fs.existsSync(url) ? path.resolve(url) : url;
-  if (!args.includes("--app-mode")) {
-    for (const host of hosts) {
-      try {
-        const opened = await openInHost(host.socket, { url: resolved });
-        print({ adopted: instanceKey(host), socket: host.socket, tab: opened.tab });
-        return true;
-      } catch {}
-    }
-    return false;
-  }
-  if (!resolved) return false;
-  const name = flagEq(args, "--app-name");
-  const idFlag = flagEq(args, "--app-id");
-  const app: NonNullable<OpenSpec["app"]> = { id: appId(idFlag ?? name ?? "app") };
-  if (name !== undefined) app.name = name;
-  const partition = flagEq(args, "--partition");
-  if (partition) app.partition = partition;
-  const preload = flagEq(args, "--preload");
-  if (preload) app.preload = path.resolve(preload);
-  const mainScript = flagEq(args, "--main-script");
-  if (mainScript) app.mainScript = path.resolve(mainScript);
-  const spec: OpenSpec = { url: resolved, app };
   for (const host of hosts) {
     try {
-      const opened = await openInHost(host.socket, spec);
+      const opened = await openInHost(host.socket, { url: resolved });
       print({ adopted: instanceKey(host), socket: host.socket, tab: opened.tab });
       return true;
     } catch {}
@@ -587,6 +562,11 @@ async function tryAdopt(args: string[]): Promise<boolean> {
 
 async function openCommand(args: string[]) {
   requirePaneAccess();
+  const owned = process.env.PIXEL_TTY ?? ownTtyPath();
+  if (process.env.PIXEL_EMBED || (owned && findOwner(owned))) {
+    rejectUnknownFlags(args);
+    return openHere(args);
+  }
   const split = takeSplitFlag(args);
   const size = takeSizeFlag(args);
   const noMerge = takeBoolFlag(args, "--no-merge") || mergeDisabled();
@@ -598,9 +578,8 @@ async function openCommand(args: string[]) {
     fail(`unexpected ${positionals[1]} (one url; --split <direction> opens a new pane)`);
   }
   const targeted = Boolean(process.env.TERMINAL_BROWSER_INTEROP_TARGET);
-  const wouldSplit = split !== null || !interactiveTty();
-  if (!noMerge && (wouldSplit || targeted) && !args.some((arg) => arg.startsWith("--ssh="))) {
-    if (await tryAdopt(args)) return;
+  if (!noMerge && (split !== null || targeted) && !args.some((arg) => arg.startsWith("--ssh="))) {
+    if (await tryAdopt(args, targeted ? null : split)) return;
   }
   await requireGraphics(await currentTerminal());
   if (!split && interactiveTty()) {
@@ -715,6 +694,10 @@ async function main(): Promise<number> {
     process.stdout.write(`terminal-browser ${installedVersion() ?? "dev"}\n`);
     return 0;
   }
+  if (command === "capabilities") {
+    process.stdout.write(`${JSON.stringify({ capabilities: CAPABILITIES })}\n`);
+    return 0;
+  }
   if (command === "help") return helpCommand(args[0]);
   if (asksForHelp(args)) {
     process.stdout.write(commandHelp(command) ?? rootHelp());
@@ -740,6 +723,7 @@ async function main(): Promise<number> {
     return editors !== 0 ? editors : sandbox;
   }
   if (command === "upgrade") return upgradeCommand();
+  if (command === "claude-bridge") return claudeBridgeCommand(args);
   if (command === "shutdown") return shutdownDaemon();
   if (command === "register-app") return registerAppCommand(args);
   if (command === "unregister-app") return unregisterAppCommand(args);
@@ -763,7 +747,7 @@ async function main(): Promise<number> {
     if (own[0] === "done") {
       own.shift();
       options.done = true;
-      if (passthrough.length > 0) fail("[PLACEHOLDER COPY]");
+      if (passthrough.length > 0) fail("error");
     }
     if (own.length > 0) fail(`unexpected ${own[0]} — put agent-browser arguments after --`);
     return actionCommand((await currentTerminal()).terminal, options);

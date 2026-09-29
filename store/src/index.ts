@@ -7,6 +7,9 @@ export {
   AGENT_SOCKETS_DIR,
   DAEMON_SOCKET,
   DB_FILE,
+  CONFIG_DIR,
+  SETTINGS_FILE,
+  SHORTCUTS_FILE,
   ensureDataDir,
 } from "./paths";
 export { openStore, store } from "./client";
@@ -32,3 +35,6 @@ export {
   withdrawInstance,
 } from "./interop";
 export type { InteropInstance, OpenResult, OpenSpec, RegisteredApp } from "./interop";
+export { TERMINAL_SOCKET_ENV, TERMINAL_SOCKET_PROTOCOL, socketTerminal } from "./terminal-socket";
+export { fetchLatestRelease, installedByHomebrew, installedChannel, installedVersion, upgradeCommand } from "./release";
+export type { LatestRelease } from "./release";

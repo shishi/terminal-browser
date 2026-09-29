@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Box, Text } from "pixel-react";
-import type { EngineInfo, Surface } from "pixel-react";
-import type { BrowserState } from "../page/types";
+import { Box, DevTools, Text, WebView } from "@zenbu-labs/pixel";
+import type { EngineInfo, Surface } from "@zenbu-labs/pixel";
+import type { WebViewState } from "@zenbu-labs/pixel";
 import { Icon } from "./icons";
 import type { IconName } from "./icons";
 import { PageContextMenu } from "./context-menu";
 import { MarkupCanvas } from "./markup-canvas";
 import { NewTabCard, PaletteCard, UrlCard } from "./modals";
 import { DownloadHud, FindBar, Toast, ZoomHud } from "./overlays";
-import { PopupModal } from "./popup-modal";
+import { SettingsCard } from "./settings";
 import {
   RecordBar,
   RecordCornerButton,
@@ -16,7 +16,7 @@ import {
   ReviewToolbar,
 } from "./record-bar";
 import { TabStrip } from "./tab-strip";
-import { makeTheme, withAlpha } from "./theme";
+import { makeTheme, mix, withAlpha } from "./theme";
 import type { Theme } from "./theme";
 import { usePulse } from "./pulse";
 import type { RecordView } from "../record/types";
@@ -25,10 +25,14 @@ import type {
   ChromeLayout,
   DownloadView,
   NewTabView,
+  DevtoolsView,
   PageMenuView,
   PaletteView,
-  PopupView,
+  SettingsView,
+  ToastView,
+  TabActions,
   TabRow,
+  TabView,
 } from "./types";
 
 export function Chrome({
@@ -42,20 +46,20 @@ export function Chrome({
   tabs,
   newTab,
   urlEdit,
-  noOverlays,
-  popup,
   zoomHud,
   download,
   toast,
   pageMenu,
+  settings,
   dividerEngaged,
   record,
   recordSurface,
-  pageSurface,
-  popupSurface,
-  devtoolsSurface,
+  tabViews,
+  tabActions,
+  devtools,
+  profiling,
 }: {
-  state: BrowserState;
+  state: WebViewState;
   actions: ChromeActions;
   layout: ChromeLayout;
   colors: EngineInfo["colors"];
@@ -65,23 +69,22 @@ export function Chrome({
   tabs: TabRow[];
   newTab: NewTabView | null;
   urlEdit: boolean;
-  noOverlays: boolean;
-  popup: PopupView | null;
   zoomHud: number | null;
   download: DownloadView | null;
-  toast: { text: string; detail?: string; failed: boolean; alert: boolean } | null;
+  toast: ToastView | null;
   pageMenu: PageMenuView | null;
+  settings: SettingsView | null;
   dividerEngaged: boolean;
   record: RecordView | null;
   recordSurface: Surface | null;
-  pageSurface: Surface;
-  popupSurface: Surface;
-  devtoolsSurface: Surface;
+  tabViews: TabView[];
+  tabActions: TabActions;
+  devtools: DevtoolsView | null;
+  profiling: boolean;
 }) {
   const theme = useMemo(() => makeTheme(colors), [colors]);
-  const progress = useProgress(!noOverlays && state.loading);
-  const agentActive =
-    !noOverlays && tabs.some((tab) => tab.active && tab.agentControlled);
+  const progress = useProgress(state.loading);
+  const agentActive = tabs.some((tab) => tab.active && tab.agentControlled);
   const glowPulse = usePulse(agentActive);
   return (
     <Box
@@ -106,22 +109,24 @@ export function Chrome({
             theme={theme}
             tabs={tabs}
             record={record}
+            profiling={profiling}
           />
         ))}
       <BrowserTabContents
         layout={layout}
         theme={theme}
-        surface={pageSurface}
-        actions={actions}
-        interactive={!record?.canvas}
+        tabs={tabViews}
+        tabActions={tabActions}
         agentActive={agentActive}
+        coveredByReview={record?.canvas != null}
       />
       {agentActive && <AgentGlow layout={layout} theme={theme} intensity={glowPulse} />}
-      {layout.devtools && (
+      {layout.devtools && devtools && (
         <DevtoolsPane
           layout={layout}
           theme={theme}
-          surface={devtoolsSurface}
+          target={tabViews.find((tab) => tab.active)?.ref ?? null}
+          devtools={devtools}
           actions={actions}
           dividerEngaged={dividerEngaged}
         />
@@ -152,15 +157,6 @@ export function Chrome({
       )}
       {download && <DownloadHud download={download} layout={layout} theme={theme} />}
       {toast && <Toast toast={toast} layout={layout} theme={theme} />}
-      {popup && (
-        <PopupModal
-          view={popup}
-          actions={actions}
-          layout={layout}
-          theme={theme}
-          surface={popupSurface}
-        />
-      )}
       {progress != null && (
         <Box
           style={{
@@ -176,7 +172,7 @@ export function Chrome({
               width: layout.page.width + 2,
               height: Math.round(layout.rem * 2),
               flexShrink: 0,
-              cornerRadius: layout.frame ? layout.rem * 0.55 : 0,
+              cornerRadius: layout.rem * 0.55,
               border: {
                 width: Math.max(2, Math.round(layout.rem * 0.12)),
                 color: theme.accent,
@@ -188,6 +184,9 @@ export function Chrome({
       {newTab && <NewTabCard view={newTab} actions={actions} layout={layout} theme={theme} />}
       {urlEdit && <UrlCard state={state} actions={actions} layout={layout} theme={theme} />}
       {palette && <PaletteCard view={palette} actions={actions} layout={layout} theme={theme} />}
+      {settings && (
+        <SettingsCard view={settings} actions={actions.settings} layout={layout} theme={theme} />
+      )}
     </Box>
   );
 }
@@ -267,13 +266,15 @@ function Toolbar({
   theme,
   tabs,
   record,
+  profiling,
 }: {
-  state: BrowserState;
+  state: WebViewState;
   actions: ChromeActions;
   layout: ChromeLayout;
   theme: Theme;
   tabs: TabRow[];
   record: RecordView | null;
+  profiling: boolean;
 }) {
   const rem = layout.rem;
   const stopIcon = useStopIcon(state.loading);
@@ -283,7 +284,8 @@ function Toolbar({
     rem * 0.8 -
     rem * 3.3 -
     (nav ? rem * 3.5 : 0) -
-    (record ? rem * 7.25 : 0);
+    (record ? rem * 7.25 : 0) -
+    (profiling ? rem * 6.5 : 0);
   return (
     <Box
       style={{
@@ -328,6 +330,40 @@ function Toolbar({
         theme={theme}
       />
       {record && <RecordToolbarPill view={record} actions={actions} rem={rem} theme={theme} />}
+      {profiling && <ProfilingPill actions={actions} rem={rem} theme={theme} />}
+    </Box>
+  );
+}
+
+function ProfilingPill({ actions, rem, theme }: { actions: ChromeActions; rem: number; theme: Theme }) {
+  const height = rem * 1.55;
+  return (
+    <Box
+      style={{
+        height,
+        alignItems: "center",
+        gap: rem * 0.4,
+        padding: { left: rem * 0.7, right: rem * 0.7 },
+        margin: { left: rem * 0.3 },
+        cornerRadius: height / 2,
+        background: mix(theme.red, theme.bg, 0.12),
+        hoverBackground: theme.red,
+        border: { width: 1, color: [255, 255, 255, 70] },
+        flexShrink: 0,
+      }}
+      onClick={actions.profileStop}
+    >
+      <Box
+        style={{
+          width: rem * 0.55,
+          height: rem * 0.55,
+          cornerRadius: rem * 0.3,
+          background: [255, 255, 255, 255],
+        }}
+      />
+      <Text style={{ fontSize: rem * 0.75, color: [255, 255, 255, 255], wrap: false, selectable: false }}>
+        Profiling
+      </Text>
     </Box>
   );
 }
@@ -362,9 +398,7 @@ function AgentGlow({
     Math.max(12, Math.round(layout.rem * 1.6)),
     Math.floor(Math.min(page.width, page.height) / 2),
   );
-  const base = layout.frame
-    ? seamRadius(Math.max(2, layout.rem * 0.55 - 1), dock, "page")
-    : 0;
+  const base = seamRadius(Math.max(2, layout.rem * 0.55 - 1), dock, "page");
   const r =
     typeof base === "number"
       ? { topLeft: base, topRight: base, bottomRight: base, bottomLeft: base }
@@ -442,22 +476,22 @@ function AgentGlow({
 function BrowserTabContents({
   layout,
   theme,
-  surface,
-  actions,
-  interactive,
+  tabs,
+  tabActions,
   agentActive,
+  coveredByReview,
 }: {
   layout: ChromeLayout;
   theme: Theme;
-  surface: Surface;
-  actions: ChromeActions;
-  interactive: boolean;
+  tabs: TabView[];
+  tabActions: TabActions;
   agentActive: boolean;
+  coveredByReview: boolean;
 }) {
   const dock = layout.devtools?.dock ?? null;
   return (
     <>
-      {interactive && layout.frame && (
+      {!coveredByReview && (
         <Box
           style={{
             position: "absolute",
@@ -465,28 +499,37 @@ function BrowserTabContents({
             width: layout.page.width + 2,
             height: layout.page.height + 2,
             cornerRadius: seamRadius(layout.rem * 0.55, dock, "page"),
-            border: { width: 1, color: agentActive ? theme.accent : theme.fieldBorder },
+            border: { width: 1, color: agentActive ? theme.accent : theme.frame },
           }}
         />
       )}
-      <Box
-        id="browser-surface"
-        surface={surface}
-        style={{
-          position: "absolute",
-          inset: { top: layout.page.y, left: layout.page.x },
-          width: layout.page.width,
-          height: layout.page.height,
-          cornerRadius: layout.frame
-            ? seamRadius(Math.max(2, layout.rem * 0.55 - 1), dock, "page")
-            : 0,
-          background: theme.bg,
-        }}
-        onPointer={interactive ? actions.pointer : undefined}
-        onWheel={interactive ? actions.wheel : undefined}
-        onMouseEnter={() => actions.pageHover(true)}
-        onMouseLeave={() => actions.pageHover(false)}
-      />
+      {tabs.map((tab) => (
+        <WebView
+          key={tab.id}
+          ref={tab.ref}
+          src={tab.url}
+          hidden={!tab.active || coveredByReview || tab.hidden}
+          autoFocus={tab.active}
+          devtools={false}
+          partition={tab.partition ?? undefined}
+          proxy={tab.proxy ?? undefined}
+          preload={tab.preload ?? undefined}
+          clipboardRead={tab.clipboardRead}
+          style={{
+            position: "absolute",
+            inset: { top: layout.page.y, left: layout.page.x },
+            width: layout.page.width,
+            height: layout.page.height,
+            cornerRadius: seamRadius(Math.max(2, layout.rem * 0.55 - 1), dock, "page"),
+            background: theme.bg,
+          }}
+          onChange={(state) => tabActions.state(tab.id, state)}
+          onOpenWindow={(details) => tabActions.openWindow(tab.id, details)}
+          onContextMenu={(params) => tabActions.contextMenu(tab.id, params)}
+          onDownload={(progress) => tabActions.download(progress)}
+          onPointer={(event) => tabActions.pointer(tab.id, event)}
+        />
+      ))}
     </>
   );
 }
@@ -497,13 +540,15 @@ const DIVIDER_GRIP = [118, 122, 132, 255] as const;
 function DevtoolsPane({
   layout,
   theme,
-  surface,
+  target,
+  devtools,
   actions,
   dividerEngaged,
 }: {
   layout: ChromeLayout;
   theme: Theme;
-  surface: Surface;
+  target: TabView["ref"] | null;
+  devtools: DevtoolsView;
   actions: ChromeActions;
   dividerEngaged: boolean;
 }) {
@@ -526,25 +571,25 @@ function DevtoolsPane({
           width: rect.width + 2,
           height: rect.height + 2,
           cornerRadius: seamRadius(layout.rem * 0.55, rect.dock, "devtools"),
-          border: { width: 1, color: theme.fieldBorder },
+          border: { width: 1, color: theme.frame },
         }}
       />
-      <Box
-        id="devtools-surface"
-        surface={surface}
-        style={{
-          position: "absolute",
-          inset: { top: rect.y, left: rect.x },
-          width: rect.width,
-          height: rect.height,
-          cornerRadius: seamRadius(Math.max(2, layout.rem * 0.55 - 1), rect.dock, "devtools"),
-          background: theme.bg,
-        }}
-        onPointer={actions.devtoolsPointer}
-        onWheel={actions.devtoolsWheel}
-        onMouseEnter={() => actions.devtoolsHover(true)}
-        onMouseLeave={() => actions.devtoolsHover(false)}
-      />
+      {target && (
+        <DevTools
+          target={target}
+          dock={devtools.dock}
+          panel={devtools.panel ?? undefined}
+          onAction={actions.devtoolsAction}
+          style={{
+            position: "absolute",
+            inset: { top: rect.y, left: rect.x },
+            width: rect.width,
+            height: rect.height,
+            cornerRadius: seamRadius(Math.max(2, layout.rem * 0.55 - 1), rect.dock, "devtools"),
+            background: theme.bg,
+          }}
+        />
+      )}
       <Box
         id="devtools-divider"
         style={{
